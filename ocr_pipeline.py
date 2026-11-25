@@ -173,7 +173,7 @@ def prepare_scrubbed_image(image_path: Path, max_dim: int = 2048) -> tuple[bytes
             img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
 
         clean_img = Image.new(img.mode, img.size)
-        clean_img.putdata(list(img.getdata()))
+        clean_img.putdata(list(img.get_flattened_data() if hasattr(img, "get_flattened_data") else img.getdata()))
 
         buf = io.BytesIO()
         clean_img.save(buf, format="PNG", optimize=True)
