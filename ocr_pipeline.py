@@ -26,7 +26,7 @@ from typing import Literal, Optional
 
 import requests
 from PIL import Image
-from pydantic import AliasChoices, BaseModel, Field, ValidationError, field_validator
+from pydantic import AliasChoices, BaseModel, Field, ValidationError, field_validator, model_validator
 
 # ==============================================================================
 # 1. DETERMINISTIC SYSTEM PROMPT & SCHEMA
@@ -58,7 +58,7 @@ Respond ONLY with valid JSON matching the required schema. Do not wrap in markdo
 
 
 class TextElement(BaseModel):
-    sequence: int = Field(..., description="1-based reading order index on page")
+    sequence: int = Field(default=0, description="1-based reading order index on page")
     role: Literal[
         "masthead",
         "running_header",
@@ -77,7 +77,11 @@ class TextElement(BaseModel):
     ]
     bbox_1000: list[int] = Field(..., min_length=4, max_length=4)
     rotation_deg: int = Field(default=0)
-    content_md: str = Field(..., description="Verbatim text with deterministic Markdown/HTML styling")
+    content_md: str = Field(
+        default="",
+        validation_alias=AliasChoices("content_md", "text", "content", "markdown"),
+        description="Verbatim text with deterministic Markdown/HTML styling",
+    )
 
 
 class VisualAsset(BaseModel):
@@ -115,6 +119,13 @@ class PageExtraction(BaseModel):
     @classmethod
     def _none_to_empty_list(cls, v):
         return [] if v is None else v
+
+    @model_validator(mode="after")
+    def _auto_sequence(self):
+        for idx, el in enumerate(self.elements, start=1):
+            if not el.sequence or el.sequence <= 0:
+                el.sequence = idx
+        return self
 
 
 # ==============================================================================
@@ -314,9 +325,12 @@ def validate_extraction(raw_json_str: str) -> PageExtraction:
     model_obj = PageExtraction.model_validate(parsed)
 
     for el in model_obj.elements:
-        ymin, xmin, ymax, xmax = el.bbox_1000
-        if not (0 <= ymin < ymax <= 1000 and 0 <= xmin < xmax <= 1000):
-            raise ValueError(f"Invalid bbox_1000 {el.bbox_1000} in sequence {el.sequence}")
+        ymin, xmin, ymax, xmax = [max(0, min(1000, int(v))) for v in el.bbox_1000]
+        if ymax <= ymin:
+            ymax = min(1000, ymin + 1)
+        if xmax <= xmin:
+            xmax = min(1000, xmin + 1)
+        el.bbox_1000 = [ymin, xmin, ymax, xmax]
     return model_obj
 
 
@@ -460,7 +474,7 @@ if __name__ == "__main__":
     parser.add_argument("--ollama-url", default="http://localhost:11434", help="Ollama base URL")
     parser.add_argument("--cloud-provider", choices=["gemini", "openai_compat"], default="gemini")
     parser.add_argument("--cloud-model", default="gemini-2.5-flash", help="Cloud VLM model ID")
-    parser.add_argument("--cloud-base-url", default="https://api.venice.ai/v1/api")
+    parser.add_argument("--cloud-base-url", default="https://api.venice.ai/api/v1")
     parser.add_argument("--max-dim", type=int, default=2048, help="Max pixel dimension before upload")
     parser.add_argument("--workers", type=int, default=1, help="Concurrent API workers")
     parser.add_argument("--limit", type=int, default=None, help="Process N pages (for incremental testing)")
