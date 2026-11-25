@@ -243,7 +243,15 @@ def call_cloud_openai_compat(
     payload = {
         "model": model,
         "temperature": 0.0,
-        "response_format": {"type": "json_object"},
+        "reasoning_effort": "low",
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "PageExtraction",
+                "strict": True,
+                "schema": PageExtraction.model_json_schema(),
+            },
+        },
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
