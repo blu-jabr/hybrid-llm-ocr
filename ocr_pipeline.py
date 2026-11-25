@@ -9,6 +9,9 @@ Hybrid Local/Cloud Verbatim Magazine OCR Pipeline
 """
 
 import argparse
+import random
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import base64
 import io
 import json
@@ -23,7 +26,7 @@ from typing import Literal, Optional
 
 import requests
 from PIL import Image
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import AliasChoices, BaseModel, Field, ValidationError, field_validator
 
 # ==============================================================================
 # 1. DETERMINISTIC SYSTEM PROMPT & SCHEMA
@@ -78,9 +81,15 @@ class TextElement(BaseModel):
 
 
 class VisualAsset(BaseModel):
-    asset_type: Literal["illustration", "photograph", "ad_graphic", "diagram", "decorative_element"]
+    asset_type: str = Field(
+        default="illustration",
+        validation_alias=AliasChoices("asset_type", "type"),
+    )
     bbox_1000: list[int] = Field(..., min_length=4, max_length=4)
-    caption_or_notes: str
+    caption_or_notes: str = Field(
+        default="",
+        validation_alias=AliasChoices("caption_or_notes", "description", "caption"),
+    )
 
 
 class PageExtraction(BaseModel):
@@ -99,8 +108,13 @@ class PageExtraction(BaseModel):
     printed_page_number: Optional[str] = None
     continuation_from: Optional[str] = None
     continuation_to: Optional[str] = None
-    elements: list[TextElement]
+    elements: list[TextElement] = Field(default_factory=list)
     visual_assets: list[VisualAsset] = Field(default_factory=list)
+
+    @field_validator("elements", "visual_assets", mode="before")
+    @classmethod
+    def _none_to_empty_list(cls, v):
+        return [] if v is None else v
 
 
 # ==============================================================================
@@ -176,7 +190,7 @@ def prepare_scrubbed_image(image_path: Path, max_dim: int = 2048) -> tuple[bytes
         clean_img.putdata(list(img.get_flattened_data() if hasattr(img, "get_flattened_data") else img.getdata()))
 
         buf = io.BytesIO()
-        clean_img.save(buf, format="PNG", optimize=True)
+        clean_img.save(buf, format="JPEG", quality=92, optimize=True)
         raw_bytes = buf.getvalue()
         b64_str = base64.b64encode(raw_bytes).decode("ascii")
         return raw_bytes, b64_str
@@ -218,7 +232,7 @@ def call_cloud_gemini(raw_bytes: bytes, anon_uuid: str, model: str) -> tuple[str
     response = client.models.generate_content(
         model=model,
         contents=[
-            types.Part.from_bytes(data=raw_bytes, mime_type="image/png"),
+            types.Part.from_bytes(data=raw_bytes, mime_type="image/jpeg"),
             f"Document Page UUID: {anon_uuid}. Extract all textual elements and visual asset bounding boxes.",
         ],
         config=types.GenerateContentConfig(
@@ -263,13 +277,18 @@ def call_cloud_openai_compat(
                     },
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{b64_image}"},
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
                     },
                 ],
             },
         ],
     }
-    resp = requests.post(f"{base_url}/chat/completions", headers=headers, json=payload, timeout=180)
+    for _attempt in range(5):
+        resp = requests.post(f"{base_url}/chat/completions", headers=headers, json=payload, timeout=180)
+        if resp.status_code in (429, 502, 503, 504) and _attempt < 4:
+            time.sleep((2 ** _attempt) + random.uniform(0.2, 1.0))
+            continue
+        break
     resp.raise_for_status()
     data = resp.json()
     content = data["choices"][0]["message"]["content"]
@@ -318,9 +337,10 @@ def process_magazine(args: argparse.Namespace) -> None:
         query += f" LIMIT {int(args.limit)}"
     rows = conn.execute(query).fetchall()
 
-    print(f"Loaded {len(rows)} pending pages in {mag_dir.name} (Mode: {args.mode})")
+    print(f"Loaded {len(rows)} pending pages in {mag_dir.name} (Mode: {args.mode}, Workers: {args.workers})")
+    db_lock = threading.Lock()
 
-    for row in rows:
+    def _run_one(row):
         page_num = row["page_num"]
         filename = row["filename"]
         anon_uuid = row["anonymous_uuid"]
@@ -378,25 +398,26 @@ def process_magazine(args: argparse.Namespace) -> None:
             out_path.write_text(json.dumps(envelope, indent=2, ensure_ascii=False), encoding="utf-8")
 
             elapsed = round(time.perf_counter() - t0, 2)
-            conn.execute(
-                """
-                UPDATE pages
-                SET status = 'completed', route_used = ?, model_name = ?,
-                    input_tokens = ?, output_tokens = ?, duration_sec = ?,
-                    error_message = NULL, updated_at = ?
-                WHERE page_num = ?
-                """,
-                (
-                    route_used,
-                    model_used,
-                    in_tokens,
-                    out_tokens,
-                    elapsed,
-                    datetime.now(timezone.utc).isoformat(),
-                    page_num,
-                ),
-            )
-            conn.commit()
+            with db_lock:
+                conn.execute(
+                    """
+                    UPDATE pages
+                    SET status = 'completed', route_used = ?, model_name = ?,
+                        input_tokens = ?, output_tokens = ?, duration_sec = ?,
+                        error_message = NULL, updated_at = ?
+                    WHERE page_num = ?
+                    """,
+                    (
+                        route_used,
+                        model_used,
+                        in_tokens,
+                        out_tokens,
+                        elapsed,
+                        datetime.now(timezone.utc).isoformat(),
+                        page_num,
+                    ),
+                )
+                conn.commit()
             print(
                 f"[Page {page_num:04d}] OK ({route_used} | {elapsed}s | "
                 f"in:{in_tokens} out:{out_tokens} tok)"
@@ -404,16 +425,26 @@ def process_magazine(args: argparse.Namespace) -> None:
 
         except (Exception, ValidationError) as err:
             elapsed = round(time.perf_counter() - t0, 2)
-            conn.execute(
-                """
-                UPDATE pages
-                SET status = 'failed', duration_sec = ?, error_message = ?, updated_at = ?
-                WHERE page_num = ?
-                """,
-                (elapsed, str(err), datetime.now(timezone.utc).isoformat(), page_num),
-            )
-            conn.commit()
+            with db_lock:
+                conn.execute(
+                    """
+                    UPDATE pages
+                    SET status = 'failed', duration_sec = ?, error_message = ?, updated_at = ?
+                    WHERE page_num = ?
+                    """,
+                    (elapsed, str(err), datetime.now(timezone.utc).isoformat(), page_num),
+                )
+                conn.commit()
             print(f"[Page {page_num:04d}] FAILED ({elapsed}s): {err}")
+
+    if args.workers <= 1:
+        for row in rows:
+            _run_one(row)
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futs = [pool.submit(_run_one, row) for row in rows]
+            for fut in as_completed(futs):
+                fut.result()
 
 
 if __name__ == "__main__":
@@ -431,6 +462,7 @@ if __name__ == "__main__":
     parser.add_argument("--cloud-model", default="gemini-2.5-flash", help="Cloud VLM model ID")
     parser.add_argument("--cloud-base-url", default="https://openrouter.ai")
     parser.add_argument("--max-dim", type=int, default=2048, help="Max pixel dimension before upload")
+    parser.add_argument("--workers", type=int, default=1, help="Concurrent API workers")
     parser.add_argument("--limit", type=int, default=None, help="Process N pages (for incremental testing)")
     args = parser.parse_args()
     process_magazine(args)
