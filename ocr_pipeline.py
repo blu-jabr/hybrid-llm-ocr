@@ -141,7 +141,7 @@ CREATE TABLE IF NOT EXISTS pages (
 
 
 def init_db(db_path: Path, pages_dir: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_SQL)
 
@@ -460,7 +460,7 @@ if __name__ == "__main__":
     parser.add_argument("--ollama-url", default="http://localhost:11434", help="Ollama base URL")
     parser.add_argument("--cloud-provider", choices=["gemini", "openai_compat"], default="gemini")
     parser.add_argument("--cloud-model", default="gemini-2.5-flash", help="Cloud VLM model ID")
-    parser.add_argument("--cloud-base-url", default="https://openrouter.ai")
+    parser.add_argument("--cloud-base-url", default="https://api.venice.ai/v1/api")
     parser.add_argument("--max-dim", type=int, default=2048, help="Max pixel dimension before upload")
     parser.add_argument("--workers", type=int, default=1, help="Concurrent API workers")
     parser.add_argument("--limit", type=int, default=None, help="Process N pages (for incremental testing)")
