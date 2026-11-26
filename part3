@@ -1,0 +1,166 @@
+cat << 'EOF' >> "$(dirname "$(realpath ocr_pipeline.py)")/assemble_issue.py"
+
+
+def detect_issue_slug(pages: list[dict]) -> tuple[str, str]:
+    for p in pages:
+        if p["page_type"] == "table_of_contents":
+            full = "\n".join(el["content_md"] for el in p["elements"])
+            m = re.search(
+                r"(January|February|March|April|May|June|July|August|September|October|November|December|Mid-December)[,\s]+(19\d{2}|20\d{2})",
+                full,
+                re.IGNORECASE,
+            )
+            if m:
+                month_name = m.group(1)
+                year = m.group(2)
+                mm = MONTH_MAP[month_name.lower()]
+                return f"Analog.{year}-{mm}", f"Analog Science Fiction/Science Fact — {month_name.title()} {year}"
+    return "Analog.Issue", "Analog Science Fiction/Science Fact"
+
+
+def parse_toc(toc_page: dict) -> tuple[list[dict], list[str], list[str]]:
+    entries = list()
+    header_notes = list()
+    footer_notes = list()
+    current_section = None
+    seen_first_section = False
+
+    for el in toc_page["elements"]:
+        role = el["role"]
+        txt = el["content_md"].strip()
+        if not txt:
+            continue
+
+        if role == "subtitle":
+            sec_clean = re.sub(r"[*#_]", "", txt).strip()
+            sec_key = sec_clean.lower()
+            if sec_key in SECTION_DIR_MAP:
+                current_section = sec_clean
+                seen_first_section = True
+                continue
+
+        if role == "table" and current_section:
+            m = re.match(r"^(.*?)\s+(\d{1,3})$", txt)
+            if m:
+                left = m.group(1).strip()
+                start_page = int(m.group(2))
+                parts = [x.strip() for x in left.split(",")]
+                title = parts.pop(0) if parts else "Untitled"
+                author = ", ".join(parts)
+                entries.append({
+                    "section": current_section,
+                    "section_dir": SECTION_DIR_MAP[current_section.lower()],
+                    "title": title,
+                    "author": author,
+                    "start_page": start_page,
+                })
+                continue
+
+        if not seen_first_section:
+            header_notes.append(txt)
+        else:
+            footer_notes.append(txt)
+
+    return entries, header_notes, footer_notes
+
+
+def extract_masthead_box(pages: list[dict]) -> list[str]:
+    box_items = list()
+    for p in pages:
+        if p["page_type"] in {"front_cover", "table_of_contents"}:
+            continue
+        mast_els = [el for el in p["elements"] if el["role"] == "masthead"]
+        if len(mast_els) >= 2:
+            for el in mast_els:
+                box_items.append(el["content_md"].strip())
+            break
+    return box_items
+
+
+def is_ornament_or_divider(asset: dict) -> bool:
+    desc = (asset.get("description") or "").lower()
+    atype = (asset.get("type") or "").lower()
+    bbox = asset.get("bbox_1000") or list()
+    if any(k in desc or k in atype for k in ("border", "divider", "ornament", "three dots", "three large dots", "separator", "line separating", "bullet point", "end-of-article", "horizontal rule")):
+        return True
+    if len(bbox) == 4:
+        h = bbox[2] - bbox[0]
+        w = bbox[3] - bbox[1]
+        if h < 55 or w < 55:
+            return True
+    return False
+
+
+def crop_assets(pages: list[dict], work_dir: Path, illus_dir: Path) -> None:
+    if Image is None:
+        return
+    pages_dir = work_dir / "pages"
+    for p in pages:
+        if p["page_type"] in {"front_cover", "advertisement"}:
+            continue
+        img_path = pages_dir / p["source_file"]
+        if not img_path.exists():
+            continue
+        ad_boxes = [el["bbox_1000"] for el in p["elements"] if el["role"] == "advertisement" and len(el["bbox_1000"]) == 4]
+        valid_assets = list()
+        for a in p["visual_assets"]:
+            if is_ornament_or_divider(a):
+                continue
+            if any(bbox_overlap_ratio(a["bbox_1000"], ab) > 0.35 for ab in ad_boxes):
+                a["is_ad_asset"] = True
+                continue
+            valid_assets.append(a)
+        if not valid_assets:
+            continue
+        with Image.open(img_path) as im:
+            w, h = im.size
+            for asset in valid_assets:
+                ymin, xmin, ymax, xmax = asset["bbox_1000"]
+                left = int(xmin / 1000 * w)
+                top = int(ymin / 1000 * h)
+                right = int(xmax / 1000 * w)
+                bottom = int(ymax / 1000 * h)
+                if right - left < 40 or bottom - top < 40:
+                    continue
+                crop = im.crop((left, top, right, bottom))
+                fname = f"p{p['page_num']:04d}-fig{asset['asset_index']}.png"
+                crop.save(illus_dir / fname)
+                asset["cropped_image"] = f"illustrations/{fname}"
+
+    # Stitch two-page facing spreads (even page 2N + odd page 2N+1 where both are illustration-only pages)
+    page_by_num = {p["page_num"]: p for p in pages}
+    for pno in sorted(page_by_num):
+        if pno % 2 != 0 or (pno + 1) not in page_by_num:
+            continue
+        left_p = page_by_num[pno]
+        right_p = page_by_num[pno + 1]
+        left_has_body = any(el["role"] == "body" for el in left_p["elements"])
+        right_has_body = any(el["role"] == "body" for el in right_p["elements"])
+        if left_has_body or right_has_body:
+            continue
+        left_imgs = [a for a in left_p["visual_assets"] if a.get("cropped_image")]
+        right_imgs = [a for a in right_p["visual_assets"] if a.get("cropped_image")]
+        if len(left_imgs) == 1 and len(right_imgs) == 1:
+            la = left_imgs.pop(0)
+            ra = right_imgs.pop(0)
+            lpath = illus_dir.parent / la["cropped_image"]
+            rpath = illus_dir.parent / ra["cropped_image"]
+            if lpath.exists() and rpath.exists():
+                with Image.open(lpath) as lim, Image.open(rpath) as rim:
+                    target_h = max(lim.height, rim.height)
+                    if lim.height != target_h:
+                        lim = lim.resize((int(lim.width * target_h / lim.height), target_h))
+                    if rim.height != target_h:
+                        rim = rim.resize((int(rim.width * target_h / rim.height), target_h))
+                    spread = Image.new("RGB", (lim.width + rim.width, target_h))
+                    spread.paste(lim.convert("RGB"), (0, 0))
+                    spread.paste(rim.convert("RGB"), (lim.width, 0))
+                    spread_name = f"p{pno:04d}-{pno + 1:04d}-spread.png"
+                    spread.save(illus_dir / spread_name)
+                    lpath.unlink(missing_ok=True)
+                    rpath.unlink(missing_ok=True)
+                    la["cropped_image"] = f"illustrations/{spread_name}"
+                    la["description"] = f"{la['description']} / {ra['description']}".strip(" /")
+                    ra["cropped_image"] = None
+EOF
+wc -l "$(dirname "$(realpath ocr_pipeline.py)")/assemble_issue.py"
