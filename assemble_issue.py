@@ -5,6 +5,7 @@ Analog Magazine OCR Normalizer & Issue Assembler (v3)
 
 import argparse
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -34,10 +35,30 @@ SECTION_DIR_MAP = {
     "readers departments": "readers_Departments",
 }
 
-KEEP_HYPHEN_PREFIXES = {
+DICT_WORDS = set()
+for _dp in ("/usr/share/dict/words", "/usr/share/dict/american-english"):
+    if os.path.exists(_dp):
+        with open(_dp, encoding="utf-8", errors="ignore") as _f:
+            DICT_WORDS = {w.strip().lower() for w in _f if w.strip().isalpha() and len(w.strip()) >= 2}
+        break
+
+CLOSED_WORDS = {
+    "notwithstanding", "nowhere", "today", "tomorrow", "tonight", "sometimes",
+    "somewhat", "somewhere", "everywhere", "anywhere", "meanwhile", "moreover",
+    "furthermore", "nevertheless", "nonetheless", "however", "therefore",
+    "heretofore", "thereafter", "underneath", "throughout", "without", "within",
+    "outside", "inside", "upon", "into", "onto", "cannot", "nobody", "nothing",
+    "anyone", "everyone", "someone", "noone", "anything", "everything", "something",
+    "anybody", "everybody", "somebody", "themselves", "ourselves", "yourselves",
+    "himself", "herself", "itself", "myself", "yourself", "alongside", "widespread",
+    "overlook", "overlooked", "overlooking", "undertake", "understood", "understand",
+    "background", "underground", "foreground", "afternoon", "overhead", "overcome",
+}
+
+TRUE_PREFIXES = {
     "self", "non", "anti", "pre", "post", "sub", "semi", "multi",
-    "co", "ex", "re", "un", "mid", "well", "ill", "all", "high", "low",
-    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "co", "re", "un", "mid", "well", "ill", "all", "high", "low",
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
     "half", "full", "open", "red", "blue", "black", "white", "dark", "light",
     "twentieth", "nineteenth", "twenty", "thirty", "forty", "fifty", "less", "than",
 }
@@ -57,26 +78,44 @@ def gfm_heading_id(heading_text: str) -> str:
     return clean
 
 
+def _should_keep_hyphen(left: str, right: str) -> bool:
+    if right.isupper():
+        return True
+    ll, rl = left.lower(), right.lower()
+    joined = ll + rl
+    if joined in CLOSED_WORDS:
+        return False
+    if DICT_WORDS:
+        # Keep hyphen when both parts are standalone English words (e.g. moderate-sized, fast-food)
+        # unless the joined word is a single dictionary word that is NOT a compound (like Tennessee, explosion, familiar)
+        if ll in DICT_WORDS and rl in DICT_WORDS:
+            return True
+        if joined in DICT_WORDS:
+            return False
+    return ll in TRUE_PREFIXES
+
+
 def repair_hyphens(text: str) -> str:
     def _join_strict(match):
         left, right = match.group(1), match.group(2)
-        if right.isupper() or left.lower() in KEEP_HYPHEN_PREFIXES:
-            return f"{left}-{right}"
-        return f"{left}{right}"
+        return f"{left}-{right}" if _should_keep_hyphen(left, right) else f"{left}{right}"
 
     def _join_wrap(match):
         left, right = match.group(1), match.group(2)
         if right.isupper():
             return f"{left}-{right}"
+        # For explicit line-wrap / hyphen+space breaks (e.g. "fa- miliar", "Ten- nessee"),
+        # join unless both halves are clear standalone words and joined isn't a single dictionary word
+        if DICT_WORDS and (left.lower() + right.lower()) in DICT_WORDS and not (left.lower() in DICT_WORDS and right.lower() in DICT_WORDS):
+            return f"{left}{right}"
+        if DICT_WORDS and left.lower() in DICT_WORDS and right.lower() in DICT_WORDS:
+            return f"{left}-{right}"
         return f"{left}{right}"
 
-    # 0) Unescape literal \n sequences if emitted by OCR
     text = text.replace("\\n", "\n")
-    # 1) Line-wrap hyphens across actual newlines or hyphen+space breaks (e.g. "Ten- nessee", "sto-\nries")
     text = re.sub(r"([A-Za-z]{2,})-\s*\n\s*([a-z]{2,})", _join_wrap, text)
     text = re.sub(r"([A-Za-z]{2,})-\s+([a-z]{2,})", _join_wrap, text)
-    # 2) Intra-line joined soft hyphens (e.g. "An-derson", "notwith-standing")
-    text = re.sub(r"\b([A-Za-z]{2,})-([a-z]{3,})\b", _join_strict, text)
+    text = re.sub(r"\b([A-Za-z]{2,})-([a-z]{2,})\b", _join_strict, text)
     return text
 
 
@@ -452,7 +491,7 @@ def stitch_and_render_elements(elements: list[dict], assets: list[dict], img_pre
         ):
             paras = txt.split("\n\n")
             first_p = paras.pop(0).lstrip()
-            out_blocks[-1] = f"{out_blocks[-1]} {first_p}"
+            out_blocks[-1] = repair_hyphens(f"{out_blocks[-1]} {first_p}")
             if pending_images:
                 for img_md in pending_images:
                     out_blocks.append(img_md)
