@@ -86,12 +86,12 @@ def _should_keep_hyphen(left: str, right: str) -> bool:
     if joined in CLOSED_WORDS:
         return False
     if DICT_WORDS:
-        # Keep hyphen when both parts are standalone English words (e.g. moderate-sized, fast-food)
-        # unless the joined word is a single dictionary word that is NOT a compound (like Tennessee, explosion, familiar)
-        if ll in DICT_WORDS and rl in DICT_WORDS:
-            return True
+        # 1) If the joined word is a valid single English word (rangers, recent, example, suburban, highways, animals), always join!
         if joined in DICT_WORDS:
             return False
+        # 2) Otherwise keep hyphen when both halves are standalone English words (moderate-sized, fast-food)
+        if len(ll) >= 3 and len(rl) >= 3 and ll in DICT_WORDS and rl in DICT_WORDS:
+            return True
     return ll in TRUE_PREFIXES
 
 
@@ -106,9 +106,9 @@ def repair_hyphens(text: str) -> str:
             return f"{left}-{right}"
         # For explicit line-wrap / hyphen+space breaks (e.g. "fa- miliar", "Ten- nessee"),
         # join unless both halves are clear standalone words and joined isn't a single dictionary word
-        if DICT_WORDS and (left.lower() + right.lower()) in DICT_WORDS and not (left.lower() in DICT_WORDS and right.lower() in DICT_WORDS):
+        if DICT_WORDS and (left.lower() + right.lower()) in DICT_WORDS:
             return f"{left}{right}"
-        if DICT_WORDS and left.lower() in DICT_WORDS and right.lower() in DICT_WORDS:
+        if DICT_WORDS and len(left) >= 3 and len(right) >= 3 and left.lower() in DICT_WORDS and right.lower() in DICT_WORDS:
             return f"{left}-{right}"
         return f"{left}{right}"
 
