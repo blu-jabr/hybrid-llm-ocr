@@ -95,27 +95,36 @@ def _should_keep_hyphen(left: str, right: str) -> bool:
     return ll in TRUE_PREFIXES
 
 
-def repair_hyphens(text: str) -> str:
-    def _join_strict(match):
-        left, right = match.group(1), match.group(2)
+def _repair_chain(match) -> str:
+    raw_chain = match.group(0)
+    # Normalize line-wrap / space-after-hyphen breaks inside the chain to single hyphens
+    norm_chain = re.sub(r"-\s+", "-", raw_chain)
+    parts = norm_chain.split("-")
+    if len(parts) == 2:
+        left, right = parts
         return f"{left}-{right}" if _should_keep_hyphen(left, right) else f"{left}{right}"
 
-    def _join_wrap(match):
-        left, right = match.group(1), match.group(2)
-        if right.isupper():
-            return f"{left}-{right}"
-        # For explicit line-wrap / hyphen+space breaks (e.g. "fa- miliar", "Ten- nessee"),
-        # join unless both halves are clear standalone words and joined isn't a single dictionary word
-        if DICT_WORDS and (left.lower() + right.lower()) in DICT_WORDS:
-            return f"{left}{right}"
-        if DICT_WORDS and len(left) >= 3 and len(right) >= 3 and left.lower() in DICT_WORDS and right.lower() in DICT_WORDS:
-            return f"{left}-{right}"
-        return f"{left}{right}"
+    # Multi-hyphen chain (3+ segments, possibly wrapped across lines, e.g. day-to-\nday or twenty-first-cen-\ntury):
+    # Merge only broken word fragments where at least one segment is NOT a standalone dictionary word
+    # and the combined pair IS a valid dictionary word.
+    merged = list()
+    i = 0
+    while i < len(parts):
+        cur = parts.pop(0)
+        if parts and DICT_WORDS:
+            nxt = parts.pop(0)
+            comb = (cur + nxt).lower()
+            if comb in DICT_WORDS and (cur.lower() not in DICT_WORDS or nxt.lower() not in DICT_WORDS):
+                merged.append(cur + nxt)
+                continue
+            parts.insert(0, nxt)
+        merged.append(cur)
+    return "-".join(merged)
 
+
+def repair_hyphens(text: str) -> str:
     text = text.replace("\\n", "\n")
-    text = re.sub(r"([A-Za-z]{2,})-\s*\n\s*([a-z]{2,})", _join_wrap, text)
-    text = re.sub(r"([A-Za-z]{2,})-\s+([a-z]{2,})", _join_wrap, text)
-    text = re.sub(r"\b([A-Za-z]{2,})-([a-z]{2,})\b", _join_strict, text)
+    text = re.sub(r"\b[A-Za-z]{2,}(?:-\s*[A-Za-z]{2,})+\b", _repair_chain, text)
     return text
 
 
